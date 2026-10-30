@@ -9,10 +9,9 @@ publishes pen and tablet-button events through `/dev/uinput`.
 
 The USB mode command and report layout are based on community driver research
 for other `08f2:6811` tablets. The vendor/product ID is reused by white-label
-models, so the report layout, pressure calibration, and button mapping still
-need confirmation on this exact ProOne unit. Do not install this as a system
-service yet; first run it interactively and compare movement, pressure, and
-buttons on the large and small areas.
+models, so this protocol may need changes for other tablets with the same ID.
+The pressure response is linear and calibrated from reports collected from
+this ProOne unit.
 
 Protocol references: [MX002 Linux user-space driver](https://github.com/marvinbelfort/mx002_linux_driver)
 and [OpenTabletDriver device-support request for Gotop T505 `08f2:6811`](https://github.com/OpenTabletDriver/OpenTabletDriver/issues/4301).
@@ -38,18 +37,67 @@ sudo ./build/proone-tablet-daemon
 ```
 
 Stop with Ctrl+C. The program releases its USB interfaces and destroys its
-virtual input device when it exits. A udev rule and systemd unit can be added
-after the device has been validated.
+virtual input device when it exits.
 
 For packet diagnostics, pass `--debug`. Debug logging is off by default to
 avoid terminal output in the input loop. Input events for each USB report are
 batched into one `/dev/uinput` write to reduce per-report system-call overhead.
 
+## Pressure settings
+
+The recommended pressure response is a linear curve across the full virtual
+pressure range. Hover reports produce zero pressure; contact maps from 0 to
+5000 as the pen moves from the lightest contact to the calibrated firm-pressure
+point. The raw tablet pressure is inverted, so lower raw readings mean more
+pressure. Contact begins at raw pressure 1400 or below and releases at 1410 or
+above to avoid brief fluctuations near the threshold lifting the pen.
+
+Pressure curves and the approved/recommended profiles are recorded in
+`pressure-settings.txt`.
+
+## Start automatically with systemd
+
+The included unit file runs the daemon as root, loads the `uinput` kernel
+module, and restarts the process if it exits with an error. Install the
+executable to `/usr/local/bin` and install the service unit:
+
+```sh
+cmake -S . -B build
+cmake --build build
+sudo cmake --install build --prefix /usr/local
+sudo install -D -m 0644 packaging/proone-tablet-daemon.service \
+  /etc/systemd/system/proone-tablet-daemon.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now proone-tablet-daemon.service
+```
+
+Check the service and follow its logs:
+
+```sh
+systemctl status proone-tablet-daemon.service
+sudo journalctl -u proone-tablet-daemon.service -f
+```
+
+After changing the source code, rebuild, reinstall the executable, and restart
+the service to load the new version:
+
+```sh
+cmake --build build
+sudo cmake --install build --prefix /usr/local
+sudo systemctl restart proone-tablet-daemon.service
+```
+
+Stop the daemon, or disable it from starting at boot:
+
+```sh
+sudo systemctl disable --now proone-tablet-daemon.service
+```
+
 ## Known first-version limitations
 
 - The driver is currently specific to the `08f2:6811` protocol family.
-- Pressure normalization and shortcut-key defaults are provisional.
-- It does not yet reconnect automatically after unplug/replug.
+- Shortcut-key defaults are provisional.
+- On USB disconnect, systemd retries the process every five seconds; the
+  daemon itself does not rediscover a tablet while it is already running.
 - Check the output of `evtest` on the created virtual device before relying on
   it in drawing applications.
-
