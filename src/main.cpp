@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cerrno>
 #include <csignal>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
@@ -24,11 +25,12 @@ constexpr std::uint16_t kProductId = 0x6811;
 constexpr std::array<unsigned char, 8> kFullAreaReport{
     0x08, 0x03, 0x00, 0xff, 0xf0, 0x00, 0xff, 0xf0};
 constexpr int kReportSize = 64;
-// Initial calibration from the ProOne's observed reports: no/very light
-// contact is around 1419; a firm press in the supplied trace reached 881.
-// This device reports lower raw values as pressure increases.
-constexpr int kPressureZeroRaw = 1419;
-constexpr int kPressureFullRaw = 881;
+// Raw pressure is inverted on this tablet: hover is around 1415-1419 and
+// firmer contact moves toward 881. Use separate contact/release thresholds
+// so small sensor fluctuations near the edge do not repeatedly lift the pen.
+constexpr int kPressureTouchThreshold = 1400;
+constexpr int kPressureReleaseThreshold = 1410;
+constexpr int kPressureFullOutputRaw = 881;
 constexpr int kVirtualPressureMaximum = 5000;
 std::atomic_bool running{true};
 
@@ -293,9 +295,12 @@ class Driver {
   }
 
   static int pressure(int raw) {
-    const int pressure_range = kPressureZeroRaw - kPressureFullRaw;
-    const int scaled = (kPressureZeroRaw - raw) * kVirtualPressureMaximum /
-                       pressure_range;
+    const int raw_range = kPressureTouchThreshold - kPressureFullOutputRaw;
+    const double normalized = std::clamp(
+        static_cast<double>(kPressureTouchThreshold - raw) / raw_range, 0.0,
+        1.0);
+    const double curve = normalized;
+    const int scaled = static_cast<int>(curve * kVirtualPressureMaximum);
     return std::clamp(scaled, 0, kVirtualPressureMaximum);
   }
 
@@ -304,13 +309,29 @@ class Driver {
     const int x = word(report, 1, 2);
     const int y = word(report, 3, 4);
     const int raw_pressure = word(report, 5, 6);
-    const int normalized_pressure = pressure(raw_pressure);
+
+    if (in_contact_) {
+      if (raw_pressure >= kPressureReleaseThreshold) in_contact_ = false;
+    } else if (raw_pressure <= kPressureTouchThreshold) {
+      in_contact_ = true;
+    }
+
+    int normalized_pressure = 0;
+    if (in_contact_) {
+      const int target_pressure = std::max(1, pressure(raw_pressure));
+      // A light one-pole filter smooths raw sensor jitter while preserving
+      // quick response. Keep at least 1 while in contact so BTN_TOUCH agrees.
+      filtered_pressure_ += (target_pressure - filtered_pressure_) / 2;
+      normalized_pressure = std::max(1, filtered_pressure_);
+    } else {
+      filtered_pressure_ = 0;
+    }
 
     output.emit(EV_ABS, ABS_X, std::clamp(x, 0, 4096));
     output.emit(EV_ABS, ABS_Y, std::clamp(y, 0, 4096));
     output.emit(EV_ABS, ABS_PRESSURE, normalized_pressure);
 
-    const bool touching = normalized_pressure > 0;
+    const bool touching = in_contact_;
     if (touching != previous_touch_) {
       output.emit(EV_KEY, BTN_TOUCH, touching ? 1 : 0);
       previous_touch_ = touching;
@@ -356,6 +377,8 @@ class Driver {
 
   std::array<bool, 14> previous_buttons_{};
   bool previous_touch_{false};
+  bool in_contact_{false};
+  int filtered_pressure_{0};
   bool previous_proximity_{false};
   bool previous_stylus_{false};
   bool previous_stylus2_{false};
